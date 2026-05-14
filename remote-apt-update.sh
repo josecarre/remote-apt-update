@@ -8,7 +8,7 @@
 # ─────────────────────────────────────────────────────────────
 set -euo pipefail
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.2.1"
 
 # ── Helpers ────────────────────────────────────────────────
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
@@ -52,7 +52,10 @@ fi
 command -v ssh >/dev/null 2>&1 || die "ssh not found in PATH."
 
 # ── Arguments ──────────────────────────────────────────────
-[[ "${1:-}" =~ ^(-h|--help)$ ]] && usage
+[[ "${1:-}" =~ ^(-h|--help|--version)$ ]] && {
+  [[ "$1" == "--version" ]] && { echo "remote-apt-update ${VERSION}"; exit 0; }
+  usage
+}
 (( $# >= 1 )) || { usage >&2; exit 1; }
 
 readonly NODE="$1"
@@ -69,7 +72,7 @@ if [[ -n "${SSH_KEY:-}" ]]; then
   [[ -f "$SSH_KEY" ]] || die "SSH_KEY not found: $SSH_KEY"
   SSH_OPTS+=(-i "$SSH_KEY")
 else
-  # Auto-discover default keys (same order as OpenSSH)
+  # Auto-discover default keys (same priority order as OpenSSH)
   for keytype in id_ed25519 id_ecdsa id_rsa; do
     keypath="$HOME/.ssh/$keytype"
     if [[ -f "$keypath" ]]; then
@@ -92,8 +95,9 @@ set -euo pipefail
 # Use sudo only when not already root
 SUDO=""; (( $(id -u) != 0 )) && SUDO="sudo" || true
 
-# Refresh repos — stderr captured separately to keep stdout clean
-APT_LOG=$($SUDO apt-get update -qq 2>&1 >/dev/null) || true
+# Refresh repos — </dev/null prevents stdin consumption over SSH
+# stderr captured separately to keep stdout clean
+APT_LOG=$($SUDO apt-get update -qq </dev/null 2>&1 >/dev/null) || true
 if [[ -n "$APT_LOG" ]]; then
   printf 'APT_WARNINGS_BEGIN\n%s\nAPT_WARNINGS_END\n' "$APT_LOG"
 fi
@@ -121,7 +125,7 @@ set -euo pipefail
 
 SUDO=""; (( $(id -u) != 0 )) && SUDO="sudo" || true
 
-APT_LOG=$($SUDO apt-get update -qq 2>&1 >/dev/null) || true
+APT_LOG=$($SUDO apt-get update -qq </dev/null 2>&1 >/dev/null) || true
 if [[ -n "$APT_LOG" ]]; then
   printf 'APT_WARNINGS_BEGIN\n%s\nAPT_WARNINGS_END\n' "$APT_LOG"
 fi
@@ -134,10 +138,15 @@ while IFS=$'\t' read -r pkg ver; do
 done <<< "$BEFORE_SORTED"
 
 # Non-interactive upgrade
-$SUDO DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
+# --with-new-pkgs: allow installing new dependencies (matches "apt upgrade")
+# </dev/null: prevent dpkg/apt from consuming SSH stdin
+# ${SUDO:+-E}: pass -E (preserve env) only when using sudo
+export DEBIAN_FRONTEND=noninteractive
+APT_RC=0
+APT_UPGRADE_OUT=$($SUDO ${SUDO:+-E} apt-get upgrade -y --with-new-pkgs \
   -o Dpkg::Options::="--force-confold" \
   -o Dpkg::Options::="--force-confdef" \
-  >/dev/null 2>&1 || true
+  </dev/null 2>&1) || APT_RC=$?
 
 # Snapshot after
 AFTER_SORTED=$(dpkg-query -W -f='${Package}\t${Version}\n' 2>/dev/null | sort)
@@ -154,11 +163,15 @@ while IFS=$'\t' read -r pkg ver_after; do
   fi
 done < <(comm -13 <(echo "$BEFORE_SORTED") <(echo "$AFTER_SORTED"))
 
-if [[ -z "$CHANGED" ]]; then
-  echo "STATUS:NOTHING_UPGRADED"
-else
+if [[ -n "$CHANGED" ]]; then
   echo "STATUS:UPGRADED"
   printf '%s' "$CHANGED"
+elif (( APT_RC != 0 )); then
+  echo "STATUS:UPGRADE_FAILED"
+  # Send last 30 lines of apt output for diagnosis
+  echo "$APT_UPGRADE_OUT" | tail -30
+else
+  echo "STATUS:NOTHING_UPGRADED"
 fi
 
 if [[ -f /var/run/reboot-required ]]; then
@@ -187,11 +200,11 @@ if grep -q '^APT_WARNINGS_BEGIN$' <<< "$REMOTE_OUTPUT" 2>/dev/null; then
   REMOTE_OUTPUT=$(sed '/^APT_WARNINGS_BEGIN$/,/^APT_WARNINGS_END$/d' <<< "$REMOTE_OUTPUT")
 fi
 
-[[ -n "$APT_WARNINGS" ]] && {
+if [[ -n "$APT_WARNINGS" ]]; then
   echo ""
   echo "⚠️  APT warnings on ${NODE}:"
   sed 's/^/  /' <<< "$APT_WARNINGS"
-}
+fi
 
 # ── Extract reboot flag ───────────────────────────────────
 REBOOT_NEEDED=false
@@ -223,6 +236,13 @@ elif has_status PACKAGES_AVAILABLE; then
 elif has_status NOTHING_UPGRADED; then
   echo "✅ System already up to date on ${NODE}."
   audit "UPGRADE — system already up to date"
+
+elif has_status UPGRADE_FAILED; then
+  APT_LOG=$(grep -v '^STATUS:' <<< "$REMOTE_OUTPUT" | grep -v '^$' || true)
+  echo "❌ Upgrade failed on ${NODE}. APT output:"
+  echo ""
+  sed 's/^/  /' <<< "$APT_LOG"
+  audit "UPGRADE FAILED — see console output"
 
 elif has_status UPGRADED; then
   PACKAGES=$(grep -v '^STATUS:' <<< "$REMOTE_OUTPUT" | grep -v '^$' || true)
